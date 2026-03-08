@@ -9,7 +9,7 @@ const app = express();
 
 // ─── Pipeline Stages ─────────────────────────────────────────────────────────
 
-const STAGES = ['Interested', 'Provided List'];
+const STAGES = ['Interested', 'Lead List Ready', 'Provided List'];
 
 // ─── Column Indices (0-based, matching sheet columns A–K) ────────────────────
 
@@ -26,6 +26,8 @@ const COL = {
   TIKTOK_FIELD:    9,  // J — "Top TikTok Shop Seller" custom variable
   REENGAGED:       10, // K — date when added to re-engagement campaign
   // Col L (11) = "Advance Stage" checkbox — managed by Apps Script only
+  SCRAPED_CSV_1:   12, // M — Scraped CSV – Partner 1 (first "and"-separated partner idea)
+  SCRAPED_CSV_2:   13, // N — Scraped CSV – Partner 2 (second "and"-separated partner idea)
 };
 
 // ─── Instantly label IDs → stage name mapping ────────────────────────────────
@@ -53,7 +55,7 @@ const sheets = google.sheets({ version: 'v4', auth });
 
 // Capture raw body for Slack signature verification before any parsing
 app.use((req, res, next) => {
-  if (req.path === '/slack/interactions') {
+  if (req.path === '/slack/interactions' || req.path === '/slack/scraper-events') {
     let data = '';
     req.on('data', chunk => { data += chunk; });
     req.on('end', () => {
@@ -73,7 +75,7 @@ app.use(express.json());
 async function getAllRows() {
   const res = await sheets.spreadsheets.values.get({
     spreadsheetId: SHEET_ID,
-    range: `${SHEET_NAME}!A:K`,
+    range: `${SHEET_NAME}!A:N`,
   });
   return (res.data.values || []).slice(1); // skip header row
 }
@@ -389,7 +391,7 @@ async function advanceStage(email, newStage, extraUpdates = {}) {
     await updateRow(found.rowIndex, updates);
   } else {
     // New lead — build a full row
-    const row = new Array(11).fill('');
+    const row = new Array(14).fill('');
     row[COL.EMAIL]      = email;
     row[COL.STAGE]      = newStage;
     row[COL.STAGE_DATE] = today;
@@ -494,11 +496,11 @@ app.post('/webhook/instantly', async (req, res) => {
       return;
     }
 
-    // ── email_sent: we sent an email → advance from Interested → Provided List
+    // ── email_sent: we sent the list → advance from Lead List Ready → Provided List
     if (eventType === 'email_sent') {
       const found = await findRowByEmail(email);
       const currentStage = found?.rowData[COL.STAGE];
-      if (currentStage === 'Interested') {
+      if (currentStage === 'Lead List Ready') {
         await advanceStage(email, 'Provided List', {
           ...(uniboxUrl ? { [COL.UNIBOX_LINK]: uniboxUrl } : {}),
         });
@@ -742,6 +744,146 @@ app.post('/slack/interactions', async (req, res) => {
   } else {
     res.status(200).send();
   }
+});
+
+// ─── Scraper Helpers ──────────────────────────────────────────────────────────
+
+function parseScraperMessage(text) {
+  const domainMatch = text.match(/\*\*Company domain:\*\*\s*([^\s\n•*]+)/i);
+  const targetMatch = text.match(/\*\*Target list:\*\*\s*([^\n•*]+)/i);
+  const driveMatch  = text.match(/Google Drive:\s*(https:\/\/drive\.google\.com\/\S+)/i);
+  return {
+    domain:     domainMatch?.[1]?.trim(),
+    targetList: targetMatch?.[1]?.trim(),
+    driveUrl:   driveMatch?.[1]?.trim(),
+  };
+}
+
+function normalizeDomain(url) {
+  if (!url) return '';
+  return url
+    .toLowerCase()
+    .replace(/^https?:\/\//i, '')
+    .replace(/^www\./i, '')
+    .replace(/\/.*$/, '')   // strip path
+    .trim();
+}
+
+// ─── Slack: Scraper Events ────────────────────────────────────────────────────
+// Receives Events API callbacks from the scraper output channel.
+// Parses the completed-run message, matches domain to a sheet row, and writes
+// the Google Drive CSV link to col M or N based on which partner idea was used.
+
+app.post('/slack/scraper-events', async (req, res) => {
+  let body;
+  try {
+    body = JSON.parse(req.rawBody || '{}');
+  } catch {
+    return res.status(400).send('Bad JSON');
+  }
+
+  // URL verification challenge — must respond synchronously before sig check
+  if (body.type === 'url_verification') {
+    return res.json({ challenge: body.challenge });
+  }
+
+  // ── Verify Slack signature ───────────────────────────────────────────────
+  const signingSecret = process.env.SLACK_SIGNING_SECRET;
+  const timestamp     = req.headers['x-slack-request-timestamp'];
+  const slackSig      = req.headers['x-slack-signature'];
+
+  if (signingSecret && timestamp && slackSig) {
+    if (Math.abs(Date.now() / 1000 - Number(timestamp)) > 300) {
+      return res.status(403).send('Request too old');
+    }
+    const baseStr  = `v0:${timestamp}:${req.rawBody || ''}`;
+    const hmac     = crypto.createHmac('sha256', signingSecret).update(baseStr).digest('hex');
+    const expected = `v0=${hmac}`;
+    if (!crypto.timingSafeEqual(Buffer.from(expected), Buffer.from(slackSig))) {
+      return res.status(403).send('Invalid signature');
+    }
+  }
+
+  res.sendStatus(200); // Ack immediately — process async
+
+  (async () => {
+    try {
+      const event = body.event || {};
+
+      // Only act on plain messages in the scraper channel; ignore bot posts & edits
+      if (
+        event.type    !== 'message' ||
+        event.channel !== process.env.SLACK_SCRAPER_CHANNEL_ID ||
+        event.bot_id  ||
+        event.subtype
+      ) return;
+
+      const { domain, targetList, driveUrl } = parseScraperMessage(event.text || '');
+
+      if (!domain || !driveUrl) {
+        console.log('[scraper] skipping message — could not parse domain or Google Drive URL');
+        return;
+      }
+
+      console.log(`[scraper] domain="${domain}" target="${targetList}" url=${driveUrl}`);
+
+      // ── Find matching row by website domain ─────────────────────────────
+      const rows      = await getAllRows();
+      const normInput = normalizeDomain(domain);
+      let idx         = rows.findIndex(r => normalizeDomain(r[COL.WEBSITE]) === normInput);
+
+      let rowIndex;
+      let currentStage   = '';
+      let wholesaleField = '';
+
+      if (idx === -1) {
+        // Domain not in sheet — create a stub row so the CSV link is recorded
+        console.warn(`[scraper] domain "${domain}" not found in sheet — creating stub row`);
+        const stubRow = new Array(14).fill('');
+        stubRow[COL.WEBSITE] = domain;
+        await appendRow(stubRow);
+        const freshRows = await getAllRows();
+        idx = freshRows.findIndex(r => normalizeDomain(r[COL.WEBSITE]) === normInput);
+        if (idx === -1) {
+          console.error('[scraper] failed to locate newly appended row');
+          return;
+        }
+        rowIndex = idx + 2;
+      } else {
+        rowIndex       = idx + 2;
+        currentStage   = rows[idx][COL.STAGE]           || '';
+        wholesaleField = rows[idx][COL.WHOLESALE_FIELD]  || '';
+      }
+
+      // ── Determine which partner column (M vs N) ──────────────────────────
+      // WHOLESALE_FIELD format: "boutique retailers and museum stores"
+      // Split on " and " (case-insensitive) to get partner ideas at index 0 and 1.
+      const partners   = wholesaleField.split(/\s+and\s+/i).map(p => p.trim().toLowerCase()).filter(Boolean);
+      const normTarget = (targetList || '').trim().toLowerCase();
+      const partnerIdx = partners.indexOf(normTarget);
+
+      const csvCol = partnerIdx === 1 ? COL.SCRAPED_CSV_2 : COL.SCRAPED_CSV_1;
+      if (partnerIdx === -1 && targetList) {
+        console.warn(`[scraper] target "${targetList}" not matched in "${wholesaleField}" — defaulting to Partner 1 column`);
+      }
+
+      const updates = { [csvCol]: driveUrl };
+
+      // ── Auto-advance stage: Interested → Lead List Ready ─────────────────
+      if (currentStage === 'Interested') {
+        const today            = new Date().toISOString().slice(0, 10);
+        updates[COL.STAGE]      = 'Lead List Ready';
+        updates[COL.STAGE_DATE] = today;
+        console.log(`[scraper] auto-advancing "${domain}": Interested → Lead List Ready`);
+      }
+
+      await updateRow(rowIndex, updates);
+      console.log(`[scraper] updated row ${rowIndex} for "${domain}" — col ${partnerIdx === 1 ? 'N' : 'M'} = ${driveUrl}`);
+
+    } catch (err) {
+      console.error('[scraper error]', err.message, err.stack);
+    }
+  })();
 });
 
 // ─── Health Check ─────────────────────────────────────────────────────────────
