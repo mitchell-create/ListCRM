@@ -68,7 +68,12 @@ app.use((req, res, next) => {
 });
 
 app.use('/slack/interactions', express.urlencoded({ extended: true }));
-app.use(express.json());
+app.use((req, res, next) => {
+  if (req.path === '/slack/interactions' || req.path === '/slack/scraper-events') {
+    return next(); // raw body already captured above; skip json parser for these paths
+  }
+  express.json()(req, res, next);
+});
 
 // ─── Google Sheets Helpers ───────────────────────────────────────────────────
 
