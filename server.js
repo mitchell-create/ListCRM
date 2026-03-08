@@ -934,7 +934,38 @@ app.post('/api/advance', async (req, res) => {
   }
 });
 
+// ─── Startup: Auto-join Slack channels ───────────────────────────────────────
+
+async function joinSlackChannel(channelId, label) {
+  const token = process.env.SLACK_BOT_TOKEN;
+  if (!channelId || !token) return;
+  try {
+    const res = await axios.post(
+      'https://slack.com/api/conversations.join',
+      { channel: channelId },
+      { headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' } }
+    );
+    if (res.data.ok) {
+      console.log(`[startup] Joined ${label} channel ${channelId}`);
+    } else {
+      // already_in_channel is fine — anything else is worth logging
+      if (res.data.error !== 'already_in_channel') {
+        console.warn(`[startup] conversations.join (${label}):`, res.data.error);
+      } else {
+        console.log(`[startup] Already in ${label} channel ${channelId}`);
+      }
+    }
+  } catch (err) {
+    console.error(`[startup] Failed to join ${label} channel:`, err.message);
+  }
+}
+
 // ─── Start ────────────────────────────────────────────────────────────────────
 
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`ListCRM running on port ${PORT}`));
+app.listen(PORT, async () => {
+  console.log(`ListCRM running on port ${PORT}`);
+  // Auto-join both channels so the bot can post and receive events
+  await joinSlackChannel(process.env.SLACK_SCRAPER_CHANNEL_ID,    'scraper');
+  await joinSlackChannel(process.env.SLACK_NOTIFICATIONS_CHANNEL_ID, 'notifications');
+});
