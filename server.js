@@ -3,6 +3,7 @@ const express  = require('express');
 const axios    = require('axios');
 const cron     = require('node-cron');
 const crypto   = require('crypto');
+const forge    = require('node-forge');
 const { google } = require('googleapis');
 
 const app = express();
@@ -37,74 +38,82 @@ const LABEL_MAP = () => ({
   'Provided List': process.env.INSTANTLY_LABEL_PROVIDED_LIST,
 });
 
-// ─── Google Sheets Auth ──────────────────────────────────────────────────────
+// ─── Google Sheets Auth (node-forge — bypasses broken OpenSSL 3) ────────────
 
 const SHEET_ID   = process.env.GOOGLE_SHEET_ID;
 const SHEET_NAME = 'Master';
 
-// ─── Parse & normalise private key (multi-strategy for OpenSSL 3) ───────────
-function parsePrivateKey() {
-  const raw = process.env.GOOGLE_PRIVATE_KEY || '';
-  console.log('[pk-diag] raw length:', raw.length);
-  console.log('[pk-diag] first 60 chars:', JSON.stringify(raw.substring(0, 60)));
-  console.log('[pk-diag] last  30 chars:', JSON.stringify(raw.substring(raw.length - 30)));
-  console.log('[pk-diag] contains literal \\\\n:', raw.includes('\\n'));
-  console.log('[pk-diag] contains real newline:', raw.includes('\n'));
-  console.log('[pk-diag] starts with quote:', raw[0] === '"', 'ends with quote:', raw[raw.length-1] === '"');
-
-  // Strategy 1: standard replace \\n → real newline
-  const pem1 = raw.replace(/\\n/g, '\n');
-  console.log('[pk-diag] after replace, real newlines:', (pem1.match(/\n/g) || []).length);
-  console.log('[pk-diag] after replace, first 80:', JSON.stringify(pem1.substring(0, 80)));
-
-  // Strategy 2: strip wrapping quotes then replace
-  let stripped = raw;
-  if (raw.startsWith('"') && raw.endsWith('"')) {
-    stripped = raw.slice(1, -1);
-    console.log('[pk-diag] stripped wrapping quotes, new length:', stripped.length);
-  }
-  const pem2 = stripped.replace(/\\n/g, '\n');
-
-  // Strategy 3: extract base64 body → DER buffer (bypasses PEM parsing entirely)
-  function tryDER(pemStr) {
-    const match = pemStr.match(/-----BEGIN [A-Z ]+-----\s*([\s\S]+?)\s*-----END [A-Z ]+-----/);
-    if (!match) return null;
-    const b64 = match[1].replace(/\s+/g, '');
-    return Buffer.from(b64, 'base64');
-  }
-
-  // Try each strategy
-  const strategies = [
-    { name: 'pem-replace',           fn: () => crypto.createPrivateKey(pem1) },
-    { name: 'pem-strip-quotes',      fn: () => crypto.createPrivateKey(pem2) },
-    { name: 'pem-object-form',       fn: () => crypto.createPrivateKey({ key: pem1, format: 'pem' }) },
-    { name: 'der-from-pem1',         fn: () => { const d = tryDER(pem1); if(!d) throw new Error('no PEM match'); return crypto.createPrivateKey({ key: d, format: 'der', type: 'pkcs8' }); }},
-    { name: 'der-from-pem2',         fn: () => { const d = tryDER(pem2); if(!d) throw new Error('no PEM match'); return crypto.createPrivateKey({ key: d, format: 'der', type: 'pkcs8' }); }},
-    { name: 'der-pkcs1',             fn: () => { const d = tryDER(pem1); if(!d) throw new Error('no PEM match'); return crypto.createPrivateKey({ key: d, format: 'der', type: 'pkcs1' }); }},
-  ];
-
-  for (const s of strategies) {
-    try {
-      const keyObj = s.fn();
-      const exported = keyObj.export({ type: 'pkcs8', format: 'pem' });
-      console.log(`[pk-diag] ✓ Strategy "${s.name}" SUCCEEDED (exported length: ${exported.length})`);
-      return exported;
-    } catch (err) {
-      console.log(`[pk-diag] ✗ Strategy "${s.name}" failed: ${err.message}`);
-    }
-  }
-
-  // Final fallback: return the replaced PEM and hope google-auth-library handles it
-  console.error('[pk-diag] ALL strategies failed — using raw replaced PEM as fallback');
-  return pem1;
+const _pemKey = (process.env.GOOGLE_PRIVATE_KEY || '').replace(/\\n/g, '\n');
+let _forgePrivateKey;
+try {
+  _forgePrivateKey = forge.pki.privateKeyFromPem(_pemKey);
+  console.log('[startup] node-forge parsed private key OK');
+} catch (err) {
+  console.error('[startup] node-forge FAILED to parse key:', err.message);
 }
 
-const _privateKey = parsePrivateKey();
+// Custom auth client: signs JWTs with node-forge, exchanges for Google access tokens
+class ForgeAuth {
+  constructor(email, privateKey, scopes) {
+    this.email = email;
+    this.privateKey = privateKey;
+    this.scopes = scopes;
+    this._cachedToken = null;
+    this._tokenExpiry = 0;
+  }
 
-const auth = new google.auth.JWT(
+  _signJWT() {
+    const now = Math.floor(Date.now() / 1000);
+    const header = JSON.stringify({ alg: 'RS256', typ: 'JWT' });
+    const payload = JSON.stringify({
+      iss: this.email,
+      scope: this.scopes.join(' '),
+      aud: 'https://oauth2.googleapis.com/token',
+      iat: now,
+      exp: now + 3600,
+    });
+    const b64Header  = Buffer.from(header).toString('base64url');
+    const b64Payload = Buffer.from(payload).toString('base64url');
+    const signInput  = `${b64Header}.${b64Payload}`;
+
+    // Sign with node-forge (pure JS RSA, no OpenSSL)
+    const md = forge.md.sha256.create();
+    md.update(signInput, 'utf8');
+    const sig = this.privateKey.sign(md);
+    const b64Sig = Buffer.from(sig, 'binary').toString('base64url');
+    return `${signInput}.${b64Sig}`;
+  }
+
+  async getAccessToken() {
+    const now = Math.floor(Date.now() / 1000);
+    if (this._cachedToken && now < this._tokenExpiry - 60) {
+      return { token: this._cachedToken };
+    }
+    const jwt = this._signJWT();
+    const resp = await axios.post('https://oauth2.googleapis.com/token', {
+      grant_type: 'urn:ietf:params:oauth:grant-type:jwt-bearer',
+      assertion: jwt,
+    });
+    this._cachedToken = resp.data.access_token;
+    this._tokenExpiry = now + (resp.data.expires_in || 3600);
+    console.log('[auth] Google access token obtained, expires in', resp.data.expires_in, 's');
+    return { token: this._cachedToken };
+  }
+
+  async getRequestHeaders() {
+    const { token } = await this.getAccessToken();
+    return { Authorization: `Bearer ${token}` };
+  }
+
+  // googleapis also calls authorize() on some code paths
+  async authorize() {
+    return this.getAccessToken();
+  }
+}
+
+const auth = new ForgeAuth(
   process.env.GOOGLE_SERVICE_ACCOUNT_EMAIL,
-  null,
-  _privateKey,
+  _forgePrivateKey,
   ['https://www.googleapis.com/auth/spreadsheets']
 );
 const sheets = google.sheets({ version: 'v4', auth });
