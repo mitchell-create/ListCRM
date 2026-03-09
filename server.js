@@ -42,18 +42,64 @@ const LABEL_MAP = () => ({
 const SHEET_ID   = process.env.GOOGLE_SHEET_ID;
 const SHEET_NAME = 'Master';
 
-// ─── Parse & normalise private key (works with any OpenSSL version) ─────────
-const _rawPK = (process.env.GOOGLE_PRIVATE_KEY || '').replace(/\\n/g, '\n');
-let _privateKey;
-try {
-  // Parse → re-export produces a clean PKCS#8 PEM that OpenSSL 3 always accepts
-  const keyObj = crypto.createPrivateKey(_rawPK);
-  _privateKey = keyObj.export({ type: 'pkcs8', format: 'pem' });
-  console.log('[startup] Private key parsed & re-exported OK (length:', _privateKey.length + ')');
-} catch (err) {
-  console.error('[startup] crypto.createPrivateKey FAILED:', err.message);
-  _privateKey = _rawPK; // fallback to raw (will likely fail later)
+// ─── Parse & normalise private key (multi-strategy for OpenSSL 3) ───────────
+function parsePrivateKey() {
+  const raw = process.env.GOOGLE_PRIVATE_KEY || '';
+  console.log('[pk-diag] raw length:', raw.length);
+  console.log('[pk-diag] first 60 chars:', JSON.stringify(raw.substring(0, 60)));
+  console.log('[pk-diag] last  30 chars:', JSON.stringify(raw.substring(raw.length - 30)));
+  console.log('[pk-diag] contains literal \\\\n:', raw.includes('\\n'));
+  console.log('[pk-diag] contains real newline:', raw.includes('\n'));
+  console.log('[pk-diag] starts with quote:', raw[0] === '"', 'ends with quote:', raw[raw.length-1] === '"');
+
+  // Strategy 1: standard replace \\n → real newline
+  const pem1 = raw.replace(/\\n/g, '\n');
+  console.log('[pk-diag] after replace, real newlines:', (pem1.match(/\n/g) || []).length);
+  console.log('[pk-diag] after replace, first 80:', JSON.stringify(pem1.substring(0, 80)));
+
+  // Strategy 2: strip wrapping quotes then replace
+  let stripped = raw;
+  if (raw.startsWith('"') && raw.endsWith('"')) {
+    stripped = raw.slice(1, -1);
+    console.log('[pk-diag] stripped wrapping quotes, new length:', stripped.length);
+  }
+  const pem2 = stripped.replace(/\\n/g, '\n');
+
+  // Strategy 3: extract base64 body → DER buffer (bypasses PEM parsing entirely)
+  function tryDER(pemStr) {
+    const match = pemStr.match(/-----BEGIN [A-Z ]+-----\s*([\s\S]+?)\s*-----END [A-Z ]+-----/);
+    if (!match) return null;
+    const b64 = match[1].replace(/\s+/g, '');
+    return Buffer.from(b64, 'base64');
+  }
+
+  // Try each strategy
+  const strategies = [
+    { name: 'pem-replace',           fn: () => crypto.createPrivateKey(pem1) },
+    { name: 'pem-strip-quotes',      fn: () => crypto.createPrivateKey(pem2) },
+    { name: 'pem-object-form',       fn: () => crypto.createPrivateKey({ key: pem1, format: 'pem' }) },
+    { name: 'der-from-pem1',         fn: () => { const d = tryDER(pem1); if(!d) throw new Error('no PEM match'); return crypto.createPrivateKey({ key: d, format: 'der', type: 'pkcs8' }); }},
+    { name: 'der-from-pem2',         fn: () => { const d = tryDER(pem2); if(!d) throw new Error('no PEM match'); return crypto.createPrivateKey({ key: d, format: 'der', type: 'pkcs8' }); }},
+    { name: 'der-pkcs1',             fn: () => { const d = tryDER(pem1); if(!d) throw new Error('no PEM match'); return crypto.createPrivateKey({ key: d, format: 'der', type: 'pkcs1' }); }},
+  ];
+
+  for (const s of strategies) {
+    try {
+      const keyObj = s.fn();
+      const exported = keyObj.export({ type: 'pkcs8', format: 'pem' });
+      console.log(`[pk-diag] ✓ Strategy "${s.name}" SUCCEEDED (exported length: ${exported.length})`);
+      return exported;
+    } catch (err) {
+      console.log(`[pk-diag] ✗ Strategy "${s.name}" failed: ${err.message}`);
+    }
+  }
+
+  // Final fallback: return the replaced PEM and hope google-auth-library handles it
+  console.error('[pk-diag] ALL strategies failed — using raw replaced PEM as fallback');
+  return pem1;
 }
+
+const _privateKey = parsePrivateKey();
 
 const auth = new google.auth.JWT(
   process.env.GOOGLE_SERVICE_ACCOUNT_EMAIL,
