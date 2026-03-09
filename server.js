@@ -51,6 +51,12 @@ const auth = new google.auth.GoogleAuth({
 });
 const sheets = google.sheets({ version: 'v4', auth });
 
+// ─── Startup: verify Google private key format ──────────────────────────────
+const _pk = (process.env.GOOGLE_PRIVATE_KEY || '').replace(/\\n/g, '\n');
+console.log('[startup] PK length:', _pk.length,
+  '| starts:', JSON.stringify(_pk.substring(0, 32)),
+  '| ends:', JSON.stringify(_pk.substring(_pk.length - 30)));
+
 // ─── Middleware ───────────────────────────────────────────────────────────────
 
 // Capture raw body for Slack signature verification before any parsing
