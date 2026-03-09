@@ -42,13 +42,12 @@ const LABEL_MAP = () => ({
 const SHEET_ID   = process.env.GOOGLE_SHEET_ID;
 const SHEET_NAME = 'Master';
 
-const auth = new google.auth.GoogleAuth({
-  credentials: {
-    client_email: process.env.GOOGLE_SERVICE_ACCOUNT_EMAIL,
-    private_key: (process.env.GOOGLE_PRIVATE_KEY || '').replace(/\\n/g, '\n'),
-  },
-  scopes: ['https://www.googleapis.com/auth/spreadsheets'],
-});
+const auth = new google.auth.JWT(
+  process.env.GOOGLE_SERVICE_ACCOUNT_EMAIL,
+  null,
+  (process.env.GOOGLE_PRIVATE_KEY || '').replace(/\\n/g, '\n'),
+  ['https://www.googleapis.com/auth/spreadsheets']
+);
 const sheets = google.sheets({ version: 'v4', auth });
 
 // ─── Startup: verify Google private key format ──────────────────────────────
