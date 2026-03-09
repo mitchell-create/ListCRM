@@ -46,8 +46,19 @@ const SHEET_NAME = 'Master';
 const _pemKey = (process.env.GOOGLE_PRIVATE_KEY || '').replace(/\\n/g, '\n');
 let _forgePrivateKey;
 try {
-  _forgePrivateKey = forge.pki.privateKeyFromPem(_pemKey);
-  console.log('[startup] node-forge parsed private key OK');
+  // Google service account keys are PKCS#8 ("BEGIN PRIVATE KEY").
+  // node-forge's privateKeyFromPem() sometimes chokes on PKCS#8, so
+  // we manually extract the base64, decode to DER, parse the ASN.1
+  // PrivateKeyInfo envelope, then pull out the inner RSA key.
+  const b64Match = _pemKey.match(
+    /-----BEGIN (?:RSA )?PRIVATE KEY-----\s*([\s\S]+?)\s*-----END/
+  );
+  if (!b64Match) throw new Error('No PEM block found in GOOGLE_PRIVATE_KEY');
+
+  const derBytes = forge.util.decode64(b64Match[1].replace(/\s+/g, ''));
+  const asn1Root = forge.asn1.fromDer(derBytes, { strict: false });
+  _forgePrivateKey = forge.pki.privateKeyFromAsn1(asn1Root);
+  console.log('[startup] node-forge parsed private key OK (PKCS#8 → RSA)');
 } catch (err) {
   console.error('[startup] node-forge FAILED to parse key:', err.message);
 }
