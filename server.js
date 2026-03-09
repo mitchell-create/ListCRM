@@ -42,19 +42,26 @@ const LABEL_MAP = () => ({
 const SHEET_ID   = process.env.GOOGLE_SHEET_ID;
 const SHEET_NAME = 'Master';
 
+// ─── Parse & normalise private key (works with any OpenSSL version) ─────────
+const _rawPK = (process.env.GOOGLE_PRIVATE_KEY || '').replace(/\\n/g, '\n');
+let _privateKey;
+try {
+  // Parse → re-export produces a clean PKCS#8 PEM that OpenSSL 3 always accepts
+  const keyObj = crypto.createPrivateKey(_rawPK);
+  _privateKey = keyObj.export({ type: 'pkcs8', format: 'pem' });
+  console.log('[startup] Private key parsed & re-exported OK (length:', _privateKey.length + ')');
+} catch (err) {
+  console.error('[startup] crypto.createPrivateKey FAILED:', err.message);
+  _privateKey = _rawPK; // fallback to raw (will likely fail later)
+}
+
 const auth = new google.auth.JWT(
   process.env.GOOGLE_SERVICE_ACCOUNT_EMAIL,
   null,
-  (process.env.GOOGLE_PRIVATE_KEY || '').replace(/\\n/g, '\n'),
+  _privateKey,
   ['https://www.googleapis.com/auth/spreadsheets']
 );
 const sheets = google.sheets({ version: 'v4', auth });
-
-// ─── Startup: verify Google private key format ──────────────────────────────
-const _pk = (process.env.GOOGLE_PRIVATE_KEY || '').replace(/\\n/g, '\n');
-console.log('[startup] PK length:', _pk.length,
-  '| starts:', JSON.stringify(_pk.substring(0, 32)),
-  '| ends:', JSON.stringify(_pk.substring(_pk.length - 30)));
 
 // ─── Middleware ───────────────────────────────────────────────────────────────
 
