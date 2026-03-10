@@ -211,13 +211,23 @@ const sheets = google.sheets({ version: 'v4', auth });
 
 // ─── Middleware ───────────────────────────────────────────────────────────────
 
-// Capture raw body for Slack signature verification before any parsing
+// Capture raw body for Slack signature verification before any parsing.
+// Also manually parse urlencoded body for /slack/interactions since
+// express.urlencoded can't read an already-consumed stream.
 app.use((req, res, next) => {
   if (req.path === '/slack/interactions' || req.path === '/slack/scraper-events') {
     let data = '';
     req.on('data', chunk => { data += chunk; });
     req.on('end', () => {
       req.rawBody = data;
+      // Parse urlencoded body for /slack/interactions (Slack sends payload=<json>)
+      if (req.path === '/slack/interactions') {
+        const params = new URLSearchParams(data);
+        req.body = {};
+        for (const [key, value] of params) {
+          req.body[key] = value;
+        }
+      }
       next();
     });
   } else {
@@ -225,7 +235,6 @@ app.use((req, res, next) => {
   }
 });
 
-app.use('/slack/interactions', express.urlencoded({ extended: true }));
 app.use((req, res, next) => {
   if (req.path === '/slack/interactions' || req.path === '/slack/scraper-events') {
     return next(); // raw body already captured above; skip json parser for these paths
@@ -623,11 +632,12 @@ app.post('/webhook/instantly', async (req, res) => {
     // ── Incoming: label / stage event ──────────────────────────────────────
     if (eventType === 'lead_interested' || eventType === 'interested') {
       await advanceStage(email, 'Interested', {
-        ...(website      ? { [COL.WEBSITE]:         website }       : {}),
-        ...(campaign     ? { [COL.CAMPAIGN]:        campaign }      : {}),
-        ...(uniboxUrl    ? { [COL.UNIBOX_LINK]:     uniboxUrl }     : {}),
+        ...(website        ? { [COL.WEBSITE]:         website }       : {}),
+        ...(campaign       ? { [COL.CAMPAIGN]:        campaign }      : {}),
+        ...(uniboxUrl      ? { [COL.UNIBOX_LINK]:     uniboxUrl }     : {}),
         ...(wholesaleField ? { [COL.WHOLESALE_FIELD]: wholesaleField } : {}),
-        ...(tiktokField  ? { [COL.TIKTOK_FIELD]:    tiktokField }   : {}),
+        ...(tiktokField    ? { [COL.TIKTOK_FIELD]:    tiktokField }   : {}),
+        ...(replySnippet   ? { [COL.LAST_REPLY]:      replySnippet }  : {}),
       });
       return;
     }
@@ -636,9 +646,10 @@ app.post('/webhook/instantly', async (req, res) => {
     if (STAGES.includes(body.event_type || body.type || '')) {
       const targetStage = body.event_type || body.type;
       await advanceStage(email, targetStage, {
-        ...(website   ? { [COL.WEBSITE]:   website }  : {}),
-        ...(campaign  ? { [COL.CAMPAIGN]:  campaign } : {}),
-        ...(uniboxUrl ? { [COL.UNIBOX_LINK]: uniboxUrl } : {}),
+        ...(website      ? { [COL.WEBSITE]:     website }      : {}),
+        ...(campaign     ? { [COL.CAMPAIGN]:    campaign }     : {}),
+        ...(uniboxUrl    ? { [COL.UNIBOX_LINK]: uniboxUrl }    : {}),
+        ...(replySnippet ? { [COL.LAST_REPLY]:  replySnippet } : {}),
       });
       return;
     }
@@ -652,7 +663,8 @@ app.post('/webhook/instantly', async (req, res) => {
         || Object.keys(labelMap).find(s => s === incomingLabelName);
       if (matchedStage) {
         await advanceStage(email, matchedStage, {
-          ...(uniboxUrl ? { [COL.UNIBOX_LINK]: uniboxUrl } : {}),
+          ...(uniboxUrl    ? { [COL.UNIBOX_LINK]: uniboxUrl }    : {}),
+          ...(replySnippet ? { [COL.LAST_REPLY]:  replySnippet } : {}),
         });
       }
       return;
