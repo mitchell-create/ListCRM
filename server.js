@@ -47,20 +47,35 @@ const _pemKey = (process.env.GOOGLE_PRIVATE_KEY || '').replace(/\\n/g, '\n');
 let _forgePrivateKey;
 try {
   // Google service account keys are PKCS#8 ("BEGIN PRIVATE KEY").
-  // node-forge's privateKeyFromPem() sometimes chokes on PKCS#8, so
-  // we manually extract the base64, decode to DER, parse the ASN.1
-  // PrivateKeyInfo envelope, then pull out the inner RSA key.
+  // forge.pki.privateKeyFromAsn1 internally calls fromDer with strict
+  // mode on the inner RSA key, so we must manually unwrap the PKCS#8
+  // PrivateKeyInfo envelope and parse the inner RSA key with strict:false.
   const b64Match = _pemKey.match(
     /-----BEGIN (?:RSA )?PRIVATE KEY-----\s*([\s\S]+?)\s*-----END/
   );
   if (!b64Match) throw new Error('No PEM block found in GOOGLE_PRIVATE_KEY');
 
-  const derBytes = forge.util.decode64(b64Match[1].replace(/\s+/g, ''));
-  const asn1Root = forge.asn1.fromDer(derBytes, { strict: false });
-  _forgePrivateKey = forge.pki.privateKeyFromAsn1(asn1Root);
-  console.log('[startup] node-forge parsed private key OK (PKCS#8 → RSA)');
+  const derStr = forge.util.decode64(b64Match[1].replace(/\s+/g, ''));
+  console.log('[pk] DER length:', derStr.length);
+
+  // Parse the outer PKCS#8 PrivateKeyInfo SEQUENCE (lenient)
+  const outerAsn1 = forge.asn1.fromDer(derStr, { strict: false, parseAllBytes: false });
+
+  // PKCS#8 structure: SEQUENCE { INTEGER(0), SEQUENCE{OID,NULL}, OCTET STRING }
+  // The OCTET STRING (index 2) contains the actual RSA key in DER
+  const innerOctetStr = outerAsn1.value[2];
+  const rsaDer = innerOctetStr.value;
+  console.log('[pk] inner RSA DER length:', rsaDer.length);
+
+  // Parse the inner RSA key ASN.1 (also lenient)
+  const rsaAsn1 = forge.asn1.fromDer(rsaDer, { strict: false, parseAllBytes: false });
+
+  // Now forge can read the RSA key fields from the already-parsed ASN.1
+  _forgePrivateKey = forge.pki.privateKeyFromAsn1(rsaAsn1);
+  console.log('[startup] node-forge parsed private key OK (manual PKCS#8 unwrap)');
 } catch (err) {
   console.error('[startup] node-forge FAILED to parse key:', err.message);
+  console.error('[startup] stack:', err.stack?.split('\n').slice(0,3).join('\n'));
 }
 
 // Custom auth client: signs JWTs with node-forge, exchanges for Google access tokens
