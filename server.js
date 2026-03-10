@@ -221,6 +221,16 @@ class ForgeAuth {
   async authorize() {
     return this.getAccessToken();
   }
+
+  // googleapis internally calls authClient.request(opts) for all API calls
+  async request(opts) {
+    const { token } = await this.getAccessToken();
+    opts.headers = opts.headers || {};
+    opts.headers.Authorization = `Bearer ${token}`;
+    const res = await axios(opts);
+    // googleapis expects { data, status, headers } shape
+    return { data: res.data, status: res.status, headers: res.headers };
+  }
 }
 
 const auth = new ForgeAuth(
