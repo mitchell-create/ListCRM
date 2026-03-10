@@ -54,6 +54,12 @@ try {
   // 9 RSA integer components, and create the forge key directly via
   // forge.pki.rsa.setPrivateKey(). Forge never touches DER/PEM bytes.
 
+  // ── Diagnostic: compare env var with expected values ──
+  const _rawKey = process.env.GOOGLE_PRIVATE_KEY || '';
+  console.log('[pk-diag] Raw env var length:', _rawKey.length);
+  console.log('[pk-diag] Contains literal backslash-n:', _rawKey.includes('\\n'));
+  console.log('[pk-diag] After replace length:', _pemKey.length);
+
   const b64Match = _pemKey.match(
     /-----BEGIN (?:RSA )?PRIVATE KEY-----\s*([\s\S]+?)\s*-----END/
   );
@@ -61,6 +67,13 @@ try {
 
   // Strip ONLY non-base64 chars (more robust than \s which may miss invisible Unicode)
   const b64Clean = b64Match[1].replace(/[^A-Za-z0-9+/=]/g, '');
+  const _b64Hash = crypto.createHash('sha256').update(b64Clean).digest('hex').substring(0, 16);
+  console.log('[pk-diag] Base64 clean length:', b64Clean.length,
+    'first40:', b64Clean.substring(0, 40),
+    'last40:', b64Clean.substring(b64Clean.length - 40));
+  console.log('[pk-diag] Base64 SHA256:', _b64Hash,
+    '(expected: e9740d8f5445bc60)');
+
   const derBuf = Buffer.from(b64Clean, 'base64');
   console.log('[pk] DER buffer length:', derBuf.length,
     'first 30 hex:', derBuf.slice(0, 30).toString('hex'));
