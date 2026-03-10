@@ -59,8 +59,11 @@ try {
   );
   if (!b64Match) throw new Error('No PEM block found in GOOGLE_PRIVATE_KEY');
 
-  const derBuf = Buffer.from(b64Match[1].replace(/\s+/g, ''), 'base64');
-  console.log('[pk] DER buffer length:', derBuf.length);
+  // Strip ONLY non-base64 chars (more robust than \s which may miss invisible Unicode)
+  const b64Clean = b64Match[1].replace(/[^A-Za-z0-9+/=]/g, '');
+  const derBuf = Buffer.from(b64Clean, 'base64');
+  console.log('[pk] DER buffer length:', derBuf.length,
+    'first 30 hex:', derBuf.slice(0, 30).toString('hex'));
 
   // ── DER helpers using Node Buffer only ──
   function readDerLength(buf, pos) {
@@ -72,29 +75,38 @@ try {
   }
 
   function readDerInteger(buf, pos) {
-    if (buf[pos] !== 0x02) throw new Error(`Expected INTEGER tag (0x02) at ${pos}, got 0x${buf[pos].toString(16)}`);
+    if (buf[pos] !== 0x02) throw new Error(`Expected INTEGER (0x02) at ${pos}, got 0x${buf[pos].toString(16)}. Surrounding hex: ${buf.slice(Math.max(0, pos - 4), pos + 8).toString('hex')}`);
     const { len, next } = readDerLength(buf, pos + 1);
     const intBytes = buf.slice(next, next + len);
     return { value: intBytes, nextPos: next + len };
   }
 
   // ── Unwrap PKCS#8 → get inner PKCS#1 RSA key bytes ──
+  // Use outer SEQUENCE length as the authoritative boundary (not OCTET STRING length)
   let rsaBuf = derBuf;
-  // Check if this is PKCS#8 (starts with SEQUENCE > INTEGER version 0 > SEQUENCE with OID)
+
   if (derBuf[0] === 0x30) {
-    const { next: seqStart } = readDerLength(derBuf, 1);
+    const { len: outerLen, next: outerContentStart } = readDerLength(derBuf, 1);
+    const outerEnd = outerContentStart + outerLen;
+    console.log('[pk] Outer SEQUENCE: content starts at', outerContentStart, 'len', outerLen, 'end', outerEnd);
+
     // Read version INTEGER
-    const { value: versionBytes, nextPos: afterVersion } = readDerInteger(derBuf, seqStart);
+    const { value: versionBytes, nextPos: afterVersion } = readDerInteger(derBuf, outerContentStart);
     if (versionBytes.length === 1 && versionBytes[0] === 0) {
-      // version == 0, check for algorithm SEQUENCE
+      // version == 0 → this is PKCS#8
       if (derBuf[afterVersion] === 0x30) {
         const { len: algoLen, next: algoStart } = readDerLength(derBuf, afterVersion + 1);
         const afterAlgo = algoStart + algoLen;
-        // Next should be OCTET STRING (0x04) containing PKCS#1 key
+        console.log('[pk] Algorithm SEQUENCE ends at offset', afterAlgo,
+          'next byte: 0x' + derBuf[afterAlgo].toString(16));
+
         if (derBuf[afterAlgo] === 0x04) {
-          const { len: rsaLen, next: rsaStart } = readDerLength(derBuf, afterAlgo + 1);
-          rsaBuf = derBuf.slice(rsaStart, rsaStart + rsaLen);
-          console.log('[pk] Unwrapped PKCS#8 → PKCS#1 RSA key:', rsaBuf.length, 'bytes');
+          // OCTET STRING found — use outer SEQUENCE end as authoritative boundary
+          const { next: rsaStart } = readDerLength(derBuf, afterAlgo + 1);
+          // Slice from rsaStart to outerEnd (trust outer SEQUENCE, not OCTET STRING length)
+          rsaBuf = derBuf.slice(rsaStart, outerEnd);
+          console.log('[pk] Unwrapped PKCS#8 → PKCS#1 RSA key:', rsaBuf.length, 'bytes (rsaStart:', rsaStart, ')');
+          console.log('[pk] RSA key first 20 hex:', rsaBuf.slice(0, 20).toString('hex'));
         }
       }
     }
@@ -103,7 +115,8 @@ try {
   // ── Parse PKCS#1 RSA key: extract 9 INTEGERs ──
   // RSAPrivateKey ::= SEQUENCE { version, n, e, d, p, q, dp, dq, qi }
   if (rsaBuf[0] !== 0x30) throw new Error('PKCS#1 key does not start with SEQUENCE');
-  const { next: rsaContentStart } = readDerLength(rsaBuf, 1);
+  const { len: rsaSeqLen, next: rsaContentStart } = readDerLength(rsaBuf, 1);
+  console.log('[pk] PKCS#1 inner SEQUENCE: content at', rsaContentStart, 'len', rsaSeqLen);
 
   let pos = rsaContentStart;
   const integers = [];
@@ -111,10 +124,10 @@ try {
   for (let i = 0; i < 9; i++) {
     const { value, nextPos } = readDerInteger(rsaBuf, pos);
     integers.push(value);
+    console.log(`[pk] INT[${i}] ${intNames[i]}: pos=${pos} len=${value.length} nextPos=${nextPos}`);
     pos = nextPos;
   }
-  console.log('[pk] Extracted', integers.length, 'RSA integers, sizes:',
-    integers.map((v, i) => `${intNames[i]}=${v.length}B`).join(', '));
+  console.log('[pk] Extracted all 9 RSA integers OK');
 
   // ── Build forge key from raw integer components (forge never touches DER) ──
   const BigInteger = forge.jsbn.BigInteger;
