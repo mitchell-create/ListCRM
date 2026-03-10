@@ -47,35 +47,51 @@ const _pemKey = (process.env.GOOGLE_PRIVATE_KEY || '').replace(/\\n/g, '\n');
 let _forgePrivateKey;
 try {
   // Google service account keys are PKCS#8 ("BEGIN PRIVATE KEY").
-  // forge.pki.privateKeyFromAsn1 internally calls fromDer with strict
-  // mode on the inner RSA key, so we must manually unwrap the PKCS#8
-  // PrivateKeyInfo envelope and parse the inner RSA key with strict:false.
+  // Both Node's OpenSSL 3 and forge's DER parser have issues on Railway,
+  // so we use Node's Buffer for PKCS#8 unwrapping and only hand forge
+  // a clean PKCS#1 PEM that it can definitely parse.
   const b64Match = _pemKey.match(
     /-----BEGIN (?:RSA )?PRIVATE KEY-----\s*([\s\S]+?)\s*-----END/
   );
   if (!b64Match) throw new Error('No PEM block found in GOOGLE_PRIVATE_KEY');
 
-  const derStr = forge.util.decode64(b64Match[1].replace(/\s+/g, ''));
-  console.log('[pk] DER length:', derStr.length);
+  const derBuf = Buffer.from(b64Match[1].replace(/\s+/g, ''), 'base64');
+  console.log('[pk] DER buffer length:', derBuf.length);
 
-  // Parse the outer PKCS#8 PrivateKeyInfo SEQUENCE (lenient)
-  const outerAsn1 = forge.asn1.fromDer(derStr, { strict: false, parseAllBytes: false });
+  // Walk the PKCS#8 DER with raw bytes to find the OCTET STRING (tag 0x04)
+  // containing the inner RSA PKCS#1 key.
+  // PKCS#8 structure: SEQUENCE { version, algorithmId, OCTET STRING(RSA key) }
+  function readDerLength(buf, pos) {
+    if (buf[pos] < 0x80) return { len: buf[pos], next: pos + 1 };
+    const numBytes = buf[pos] & 0x7f;
+    let len = 0;
+    for (let i = 0; i < numBytes; i++) len = (len << 8) | buf[pos + 1 + i];
+    return { len, next: pos + 1 + numBytes };
+  }
 
-  // PKCS#8 structure: SEQUENCE { INTEGER(0), SEQUENCE{OID,NULL}, OCTET STRING }
-  // The OCTET STRING (index 2) contains the actual RSA key in DER
-  const innerOctetStr = outerAsn1.value[2];
-  const rsaDer = innerOctetStr.value;
-  console.log('[pk] inner RSA DER length:', rsaDer.length);
+  // Find the OCTET STRING tag (0x04) within the first 30 bytes
+  let rsaKeyBuf = null;
+  for (let i = 4; i < 30 && i < derBuf.length; i++) {
+    if (derBuf[i] === 0x04) {
+      const { len, next } = readDerLength(derBuf, i + 1);
+      rsaKeyBuf = derBuf.slice(next, next + len);
+      console.log('[pk] Found OCTET STRING at offset', i, '→ RSA key', rsaKeyBuf.length, 'bytes');
+      break;
+    }
+  }
+  if (!rsaKeyBuf) throw new Error('Could not find OCTET STRING in PKCS#8 DER');
 
-  // Parse the inner RSA key ASN.1 (also lenient)
-  const rsaAsn1 = forge.asn1.fromDer(rsaDer, { strict: false, parseAllBytes: false });
+  // Convert inner RSA key to PKCS#1 PEM that forge natively understands
+  const rsaB64 = rsaKeyBuf.toString('base64');
+  const pkcs1Pem = '-----BEGIN RSA PRIVATE KEY-----\n' +
+    rsaB64.match(/.{1,64}/g).join('\n') +
+    '\n-----END RSA PRIVATE KEY-----';
 
-  // Now forge can read the RSA key fields from the already-parsed ASN.1
-  _forgePrivateKey = forge.pki.privateKeyFromAsn1(rsaAsn1);
-  console.log('[startup] node-forge parsed private key OK (manual PKCS#8 unwrap)');
+  _forgePrivateKey = forge.pki.privateKeyFromPem(pkcs1Pem);
+  console.log('[startup] Private key parsed OK (Buffer PKCS#8 unwrap → PKCS#1 PEM → forge)');
 } catch (err) {
   console.error('[startup] node-forge FAILED to parse key:', err.message);
-  console.error('[startup] stack:', err.stack?.split('\n').slice(0,3).join('\n'));
+  console.error('[startup] stack:', err.stack?.split('\n').slice(0, 3).join('\n'));
 }
 
 // Custom auth client: signs JWTs with node-forge, exchanges for Google access tokens
