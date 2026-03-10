@@ -47,9 +47,13 @@ const _pemKey = (process.env.GOOGLE_PRIVATE_KEY || '').replace(/\\n/g, '\n');
 let _forgePrivateKey;
 try {
   // Google service account keys are PKCS#8 ("BEGIN PRIVATE KEY").
-  // Both Node's OpenSSL 3 and forge's DER parser have issues on Railway,
-  // so we use Node's Buffer for PKCS#8 unwrapping and only hand forge
-  // a clean PKCS#1 PEM that it can definitely parse.
+  // Both Node's OpenSSL 3 AND forge's internal DER parser fail on Railway
+  // (forge uses Latin-1 byte strings which produce different byte counts).
+  //
+  // Strategy: Use ONLY Node Buffer for ALL byte operations, extract the
+  // 9 RSA integer components, and create the forge key directly via
+  // forge.pki.rsa.setPrivateKey(). Forge never touches DER/PEM bytes.
+
   const b64Match = _pemKey.match(
     /-----BEGIN (?:RSA )?PRIVATE KEY-----\s*([\s\S]+?)\s*-----END/
   );
@@ -58,9 +62,7 @@ try {
   const derBuf = Buffer.from(b64Match[1].replace(/\s+/g, ''), 'base64');
   console.log('[pk] DER buffer length:', derBuf.length);
 
-  // Walk the PKCS#8 DER with raw bytes to find the OCTET STRING (tag 0x04)
-  // containing the inner RSA PKCS#1 key.
-  // PKCS#8 structure: SEQUENCE { version, algorithmId, OCTET STRING(RSA key) }
+  // ── DER helpers using Node Buffer only ──
   function readDerLength(buf, pos) {
     if (buf[pos] < 0x80) return { len: buf[pos], next: pos + 1 };
     const numBytes = buf[pos] & 0x7f;
@@ -69,28 +71,70 @@ try {
     return { len, next: pos + 1 + numBytes };
   }
 
-  // Find the OCTET STRING tag (0x04) within the first 30 bytes
-  let rsaKeyBuf = null;
-  for (let i = 4; i < 30 && i < derBuf.length; i++) {
-    if (derBuf[i] === 0x04) {
-      const { len, next } = readDerLength(derBuf, i + 1);
-      rsaKeyBuf = derBuf.slice(next, next + len);
-      console.log('[pk] Found OCTET STRING at offset', i, '→ RSA key', rsaKeyBuf.length, 'bytes');
-      break;
+  function readDerInteger(buf, pos) {
+    if (buf[pos] !== 0x02) throw new Error(`Expected INTEGER tag (0x02) at ${pos}, got 0x${buf[pos].toString(16)}`);
+    const { len, next } = readDerLength(buf, pos + 1);
+    const intBytes = buf.slice(next, next + len);
+    return { value: intBytes, nextPos: next + len };
+  }
+
+  // ── Unwrap PKCS#8 → get inner PKCS#1 RSA key bytes ──
+  let rsaBuf = derBuf;
+  // Check if this is PKCS#8 (starts with SEQUENCE > INTEGER version 0 > SEQUENCE with OID)
+  if (derBuf[0] === 0x30) {
+    const { next: seqStart } = readDerLength(derBuf, 1);
+    // Read version INTEGER
+    const { value: versionBytes, nextPos: afterVersion } = readDerInteger(derBuf, seqStart);
+    if (versionBytes.length === 1 && versionBytes[0] === 0) {
+      // version == 0, check for algorithm SEQUENCE
+      if (derBuf[afterVersion] === 0x30) {
+        const { len: algoLen, next: algoStart } = readDerLength(derBuf, afterVersion + 1);
+        const afterAlgo = algoStart + algoLen;
+        // Next should be OCTET STRING (0x04) containing PKCS#1 key
+        if (derBuf[afterAlgo] === 0x04) {
+          const { len: rsaLen, next: rsaStart } = readDerLength(derBuf, afterAlgo + 1);
+          rsaBuf = derBuf.slice(rsaStart, rsaStart + rsaLen);
+          console.log('[pk] Unwrapped PKCS#8 → PKCS#1 RSA key:', rsaBuf.length, 'bytes');
+        }
+      }
     }
   }
-  if (!rsaKeyBuf) throw new Error('Could not find OCTET STRING in PKCS#8 DER');
 
-  // Convert inner RSA key to PKCS#1 PEM that forge natively understands
-  const rsaB64 = rsaKeyBuf.toString('base64');
-  const pkcs1Pem = '-----BEGIN RSA PRIVATE KEY-----\n' +
-    rsaB64.match(/.{1,64}/g).join('\n') +
-    '\n-----END RSA PRIVATE KEY-----';
+  // ── Parse PKCS#1 RSA key: extract 9 INTEGERs ──
+  // RSAPrivateKey ::= SEQUENCE { version, n, e, d, p, q, dp, dq, qi }
+  if (rsaBuf[0] !== 0x30) throw new Error('PKCS#1 key does not start with SEQUENCE');
+  const { next: rsaContentStart } = readDerLength(rsaBuf, 1);
 
-  _forgePrivateKey = forge.pki.privateKeyFromPem(pkcs1Pem);
-  console.log('[startup] Private key parsed OK (Buffer PKCS#8 unwrap → PKCS#1 PEM → forge)');
+  let pos = rsaContentStart;
+  const integers = [];
+  const intNames = ['version', 'n', 'e', 'd', 'p', 'q', 'dp', 'dq', 'qi'];
+  for (let i = 0; i < 9; i++) {
+    const { value, nextPos } = readDerInteger(rsaBuf, pos);
+    integers.push(value);
+    pos = nextPos;
+  }
+  console.log('[pk] Extracted', integers.length, 'RSA integers, sizes:',
+    integers.map((v, i) => `${intNames[i]}=${v.length}B`).join(', '));
+
+  // ── Build forge key from raw integer components (forge never touches DER) ──
+  const BigInteger = forge.jsbn.BigInteger;
+  function bufToBigInt(buf) {
+    return new BigInteger(buf.toString('hex'), 16);
+  }
+
+  _forgePrivateKey = forge.pki.rsa.setPrivateKey(
+    bufToBigInt(integers[1]),  // n
+    bufToBigInt(integers[2]),  // e
+    bufToBigInt(integers[3]),  // d
+    bufToBigInt(integers[4]),  // p
+    bufToBigInt(integers[5]),  // q
+    bufToBigInt(integers[6]),  // dp
+    bufToBigInt(integers[7]),  // dq
+    bufToBigInt(integers[8])   // qi
+  );
+  console.log('[startup] Private key parsed OK (Buffer DER → raw integers → forge.pki.rsa.setPrivateKey)');
 } catch (err) {
-  console.error('[startup] node-forge FAILED to parse key:', err.message);
+  console.error('[startup] FAILED to parse private key:', err.message);
   console.error('[startup] stack:', err.stack?.split('\n').slice(0, 3).join('\n'));
 }
 
