@@ -54,29 +54,13 @@ try {
   // 9 RSA integer components, and create the forge key directly via
   // forge.pki.rsa.setPrivateKey(). Forge never touches DER/PEM bytes.
 
-  // ── Diagnostic: compare env var with expected values ──
-  const _rawKey = process.env.GOOGLE_PRIVATE_KEY || '';
-  console.log('[pk-diag] Raw env var length:', _rawKey.length);
-  console.log('[pk-diag] Contains literal backslash-n:', _rawKey.includes('\\n'));
-  console.log('[pk-diag] After replace length:', _pemKey.length);
-
   const b64Match = _pemKey.match(
     /-----BEGIN (?:RSA )?PRIVATE KEY-----\s*([\s\S]+?)\s*-----END/
   );
   if (!b64Match) throw new Error('No PEM block found in GOOGLE_PRIVATE_KEY');
 
-  // Strip ONLY non-base64 chars (more robust than \s which may miss invisible Unicode)
   const b64Clean = b64Match[1].replace(/[^A-Za-z0-9+/=]/g, '');
-  const _b64Hash = crypto.createHash('sha256').update(b64Clean).digest('hex').substring(0, 16);
-  console.log('[pk-diag] Base64 clean length:', b64Clean.length,
-    'first40:', b64Clean.substring(0, 40),
-    'last40:', b64Clean.substring(b64Clean.length - 40));
-  console.log('[pk-diag] Base64 SHA256:', _b64Hash,
-    '(expected: e9740d8f5445bc60)');
-
   const derBuf = Buffer.from(b64Clean, 'base64');
-  console.log('[pk] DER buffer length:', derBuf.length,
-    'first 30 hex:', derBuf.slice(0, 30).toString('hex'));
 
   // ── DER helpers using Node Buffer only ──
   function readDerLength(buf, pos) {
@@ -88,38 +72,28 @@ try {
   }
 
   function readDerInteger(buf, pos) {
-    if (buf[pos] !== 0x02) throw new Error(`Expected INTEGER (0x02) at ${pos}, got 0x${buf[pos].toString(16)}. Surrounding hex: ${buf.slice(Math.max(0, pos - 4), pos + 8).toString('hex')}`);
+    if (buf[pos] !== 0x02) throw new Error(`Expected INTEGER (0x02) at ${pos}, got 0x${buf[pos].toString(16)}`);
     const { len, next } = readDerLength(buf, pos + 1);
     const intBytes = buf.slice(next, next + len);
     return { value: intBytes, nextPos: next + len };
   }
 
   // ── Unwrap PKCS#8 → get inner PKCS#1 RSA key bytes ──
-  // Use outer SEQUENCE length as the authoritative boundary (not OCTET STRING length)
   let rsaBuf = derBuf;
 
   if (derBuf[0] === 0x30) {
     const { len: outerLen, next: outerContentStart } = readDerLength(derBuf, 1);
     const outerEnd = outerContentStart + outerLen;
-    console.log('[pk] Outer SEQUENCE: content starts at', outerContentStart, 'len', outerLen, 'end', outerEnd);
 
-    // Read version INTEGER
     const { value: versionBytes, nextPos: afterVersion } = readDerInteger(derBuf, outerContentStart);
     if (versionBytes.length === 1 && versionBytes[0] === 0) {
-      // version == 0 → this is PKCS#8
       if (derBuf[afterVersion] === 0x30) {
         const { len: algoLen, next: algoStart } = readDerLength(derBuf, afterVersion + 1);
         const afterAlgo = algoStart + algoLen;
-        console.log('[pk] Algorithm SEQUENCE ends at offset', afterAlgo,
-          'next byte: 0x' + derBuf[afterAlgo].toString(16));
 
         if (derBuf[afterAlgo] === 0x04) {
-          // OCTET STRING found — use outer SEQUENCE end as authoritative boundary
           const { next: rsaStart } = readDerLength(derBuf, afterAlgo + 1);
-          // Slice from rsaStart to outerEnd (trust outer SEQUENCE, not OCTET STRING length)
           rsaBuf = derBuf.slice(rsaStart, outerEnd);
-          console.log('[pk] Unwrapped PKCS#8 → PKCS#1 RSA key:', rsaBuf.length, 'bytes (rsaStart:', rsaStart, ')');
-          console.log('[pk] RSA key first 20 hex:', rsaBuf.slice(0, 20).toString('hex'));
         }
       }
     }
@@ -128,19 +102,15 @@ try {
   // ── Parse PKCS#1 RSA key: extract 9 INTEGERs ──
   // RSAPrivateKey ::= SEQUENCE { version, n, e, d, p, q, dp, dq, qi }
   if (rsaBuf[0] !== 0x30) throw new Error('PKCS#1 key does not start with SEQUENCE');
-  const { len: rsaSeqLen, next: rsaContentStart } = readDerLength(rsaBuf, 1);
-  console.log('[pk] PKCS#1 inner SEQUENCE: content at', rsaContentStart, 'len', rsaSeqLen);
+  const { next: rsaContentStart } = readDerLength(rsaBuf, 1);
 
   let pos = rsaContentStart;
   const integers = [];
-  const intNames = ['version', 'n', 'e', 'd', 'p', 'q', 'dp', 'dq', 'qi'];
   for (let i = 0; i < 9; i++) {
     const { value, nextPos } = readDerInteger(rsaBuf, pos);
     integers.push(value);
-    console.log(`[pk] INT[${i}] ${intNames[i]}: pos=${pos} len=${value.length} nextPos=${nextPos}`);
     pos = nextPos;
   }
-  console.log('[pk] Extracted all 9 RSA integers OK');
 
   // ── Build forge key from raw integer components (forge never touches DER) ──
   const BigInteger = forge.jsbn.BigInteger;
@@ -158,10 +128,9 @@ try {
     bufToBigInt(integers[7]),  // dq
     bufToBigInt(integers[8])   // qi
   );
-  console.log('[startup] Private key parsed OK (Buffer DER → raw integers → forge.pki.rsa.setPrivateKey)');
+  console.log('[startup] Private key parsed OK');
 } catch (err) {
   console.error('[startup] FAILED to parse private key:', err.message);
-  console.error('[startup] stack:', err.stack?.split('\n').slice(0, 3).join('\n'));
 }
 
 // Custom auth client: signs JWTs with node-forge, exchanges for Google access tokens
@@ -628,8 +597,7 @@ app.post('/webhook/instantly', async (req, res) => {
   res.sendStatus(200); // Acknowledge immediately
   const body = req.body || {};
 
-  // Log full payload on first few events to confirm field names
-  console.log('[webhook] raw body:', JSON.stringify(body).substring(0, 600));
+  console.log('[webhook]', body.event_type || body.type, body.lead_email || body.email);
 
   try {
     const email = (body.lead_email || body.email || '').toLowerCase().trim();
