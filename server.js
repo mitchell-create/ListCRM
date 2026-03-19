@@ -11,6 +11,7 @@ const app = express();
 // ─── Pipeline Stages ─────────────────────────────────────────────────────────
 
 const STAGES = ['Interested', 'Lead List Ready', 'Provided List'];
+const PARKED_STAGE = 'Parked';  // Holding stage — outside the normal pipeline flow
 
 // ─── Column Indices (0-based, matching sheet columns A–K) ────────────────────
 
@@ -36,7 +37,15 @@ const COL = {
 const LABEL_MAP = () => ({
   'Interested':    process.env.INSTANTLY_LABEL_INTERESTED,
   'Provided List': process.env.INSTANTLY_LABEL_PROVIDED_LIST,
+  'Parked':        process.env.INSTANTLY_LABEL_PARKED,
 });
+
+// Instantly labels that should be treated as "Interested" in our pipeline.
+// "Asked For More Details" is frequently auto-applied by Instantly AI even when the lead is interested.
+const INTERESTED_ALIASES = () => {
+  const ids = (process.env.INSTANTLY_LABELS_TREAT_AS_INTERESTED || '').split(',').filter(Boolean);
+  return ids;
+};
 
 // ─── Google Sheets Auth (node-forge — bypasses broken OpenSSL 3) ────────────
 
@@ -498,27 +507,55 @@ async function notifySlack(lead, oldStage, newStage, suggestedReply) {
     });
   }
 
-  // Advance Stage button — only when not at final stage
+  // Stage action buttons
   const stageIdx = STAGES.indexOf(newStage);
+  const stageButtons = [];
+
+  // Advance Stage button — only when not at final stage and not parked
   if (stageIdx >= 0 && stageIdx < STAGES.length - 1) {
     const nextStage = STAGES[stageIdx + 1];
+    stageButtons.push({
+      type: 'button',
+      action_id: 'advance_stage',
+      text: { type: 'plain_text', text: `⬆️ Advance to ${nextStage}`, emoji: true },
+      value: lead.email,
+      confirm: {
+        title:   { type: 'plain_text', text: 'Advance Stage?' },
+        text:    { type: 'mrkdwn', text: `Move *${lead.website || lead.email}* from *${newStage}* → *${nextStage}*?` },
+        confirm: { type: 'plain_text', text: 'Advance' },
+        deny:    { type: 'plain_text', text: 'Cancel' },
+      },
+    });
+  }
+
+  // Park / Unpark button
+  if (newStage === PARKED_STAGE) {
+    stageButtons.push({
+      type: 'button',
+      action_id: 'unpark_lead',
+      text: { type: 'plain_text', text: '♻️ Unpark Lead', emoji: true },
+      value: lead.email,
+    });
+  } else {
+    stageButtons.push({
+      type: 'button',
+      action_id: 'park_lead',
+      text: { type: 'plain_text', text: '🅿️ Park Lead', emoji: true },
+      value: lead.email,
+      confirm: {
+        title:   { type: 'plain_text', text: 'Park this lead?' },
+        text:    { type: 'mrkdwn', text: `Move *${lead.website || lead.email}* to *Parked*? You can unpark them later.` },
+        confirm: { type: 'plain_text', text: 'Park' },
+        deny:    { type: 'plain_text', text: 'Cancel' },
+      },
+    });
+  }
+
+  if (stageButtons.length > 0) {
     blocks.push({
       type: 'actions',
       block_id: 'stage_actions',
-      elements: [
-        {
-          type: 'button',
-          action_id: 'advance_stage',
-          text: { type: 'plain_text', text: `⬆️ Advance to ${nextStage}`, emoji: true },
-          value: lead.email,
-          confirm: {
-            title:   { type: 'plain_text', text: 'Advance Stage?' },
-            text:    { type: 'mrkdwn', text: `Move *${lead.website || lead.email}* from *${newStage}* → *${nextStage}*?` },
-            confirm: { type: 'plain_text', text: 'Advance' },
-            deny:    { type: 'plain_text', text: 'Cancel' },
-          },
-        },
-      ],
+      elements: stageButtons,
     });
   }
 
@@ -544,10 +581,13 @@ async function advanceStage(email, newStage, extraUpdates = {}) {
   const found       = await findRowByEmail(email);
   const currentStage = found?.rowData[COL.STAGE] || null;
 
-  // Guard: don't move backward
+  // Parked is always allowed — it's a special holding stage, not part of the linear pipeline
+  const isParking = newStage === PARKED_STAGE;
+
+  // Guard: don't move backward (unless parking)
   const currentIdx = STAGES.indexOf(currentStage);
   const newIdx     = STAGES.indexOf(newStage);
-  if (currentIdx >= 0 && newIdx <= currentIdx) {
+  if (!isParking && currentIdx >= 0 && newIdx <= currentIdx) {
     console.log(`[advance] skipped — ${email} already at "${currentStage}", not moving to "${newStage}"`);
     return;
   }
@@ -630,7 +670,7 @@ app.post('/webhook/instantly', async (req, res) => {
     const eventType = (body.event_type || body.type || '').toLowerCase();
 
     // ── Incoming: label / stage event ──────────────────────────────────────
-    if (eventType === 'lead_interested' || eventType === 'interested') {
+    if (eventType === 'lead_interested' || eventType === 'interested' || eventType === 'asked_for_more_details') {
       await advanceStage(email, 'Interested', {
         ...(website        ? { [COL.WEBSITE]:         website }       : {}),
         ...(campaign       ? { [COL.CAMPAIGN]:        campaign }      : {}),
@@ -661,10 +701,23 @@ app.post('/webhook/instantly', async (req, res) => {
       const incomingLabelName = (body.label_name || body.labelName || '').trim();
       const matchedStage = Object.entries(labelMap).find(([, id]) => id && id === incomingLabelId)?.[0]
         || Object.keys(labelMap).find(s => s === incomingLabelName);
-      if (matchedStage) {
-        await advanceStage(email, matchedStage, {
-          ...(uniboxUrl    ? { [COL.UNIBOX_LINK]: uniboxUrl }    : {}),
-          ...(replySnippet ? { [COL.LAST_REPLY]:  replySnippet } : {}),
+
+      // Check if this label is an alias for "Interested" (e.g. "Asked For More Details")
+      const aliases = INTERESTED_ALIASES();
+      const isInterestedAlias = aliases.includes(incomingLabelId)
+        || aliases.includes(incomingLabelName);
+
+      const targetStage = matchedStage || (isInterestedAlias ? 'Interested' : null);
+
+      if (targetStage) {
+        console.log(`[webhook] label "${incomingLabelName || incomingLabelId}" → treating as "${targetStage}"`);
+        await advanceStage(email, targetStage, {
+          ...(website        ? { [COL.WEBSITE]:         website }       : {}),
+          ...(campaign       ? { [COL.CAMPAIGN]:        campaign }      : {}),
+          ...(uniboxUrl      ? { [COL.UNIBOX_LINK]:     uniboxUrl }    : {}),
+          ...(wholesaleField ? { [COL.WHOLESALE_FIELD]: wholesaleField } : {}),
+          ...(tiktokField    ? { [COL.TIKTOK_FIELD]:    tiktokField }   : {}),
+          ...(replySnippet   ? { [COL.LAST_REPLY]:      replySnippet } : {}),
         });
       }
       return;
@@ -895,6 +948,49 @@ app.post('/slack/interactions', async (req, res) => {
       } catch (err) {
         console.error('[slack] advance_stage error:', err.message);
         await axios.post(responseUrl, { text: `❌ Advance failed: ${err.message}`, replace_original: false });
+      }
+
+    } else if (action.action_id === 'park_lead') {
+      try {
+        const found = await findRowByEmail(email);
+        const currentStage = found?.rowData[COL.STAGE] || 'Unknown';
+        const today = new Date().toISOString().slice(0, 10);
+        if (found) {
+          await updateRow(found.rowIndex, {
+            [COL.STAGE]:      PARKED_STAGE,
+            [COL.STAGE_DATE]: today,
+          });
+        }
+        console.log(`[slack→park] ${email}: ${currentStage} → ${PARKED_STAGE}`);
+        await axios.post(responseUrl, {
+          replace_original: true,
+          blocks: withSentStatus(origBlocks, `🅿️ *Lead parked* (was ${currentStage}) — ${new Date().toLocaleString()}`),
+        });
+      } catch (err) {
+        console.error('[slack] park_lead error:', err.message);
+        await axios.post(responseUrl, { text: `❌ Park failed: ${err.message}`, replace_original: false });
+      }
+
+    } else if (action.action_id === 'unpark_lead') {
+      try {
+        const found = await findRowByEmail(email);
+        // Unpark back to "Interested" — the first stage
+        const restoreStage = STAGES[0];
+        const today = new Date().toISOString().slice(0, 10);
+        if (found) {
+          await updateRow(found.rowIndex, {
+            [COL.STAGE]:      restoreStage,
+            [COL.STAGE_DATE]: today,
+          });
+        }
+        console.log(`[slack→unpark] ${email}: ${PARKED_STAGE} → ${restoreStage}`);
+        await axios.post(responseUrl, {
+          replace_original: true,
+          blocks: withSentStatus(origBlocks, `♻️ *Lead unparked → ${restoreStage}* — ${new Date().toLocaleString()}`),
+        });
+      } catch (err) {
+        console.error('[slack] unpark_lead error:', err.message);
+        await axios.post(responseUrl, { text: `❌ Unpark failed: ${err.message}`, replace_original: false });
       }
     }
 
