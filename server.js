@@ -37,14 +37,14 @@ const COL = {
 const LABEL_MAP = () => ({
   'Interested':    process.env.INSTANTLY_LABEL_INTERESTED,
   'Provided List': process.env.INSTANTLY_LABEL_PROVIDED_LIST,
-  'Parked':        process.env.INSTANTLY_LABEL_PARKED,
+  'Parked':        process.env.INSTANTLY_LABEL_PARKED || '-29997',
 });
 
 // Instantly labels that should be treated as "Interested" in our pipeline.
 // "Asked For More Details" is frequently auto-applied by Instantly AI even when the lead is interested.
 const INTERESTED_ALIASES = () => {
-  const ids = (process.env.INSTANTLY_LABELS_TREAT_AS_INTERESTED || '').split(',').filter(Boolean);
-  return ids;
+  const raw = process.env.INSTANTLY_LABELS_TREAT_AS_INTERESTED || 'Asked For More Details';
+  return raw.split(',').filter(Boolean);
 };
 
 // ─── Google Sheets Auth (node-forge — bypasses broken OpenSSL 3) ────────────
