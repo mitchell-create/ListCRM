@@ -11,7 +11,17 @@ const app = express();
 // ─── Pipeline Stages ─────────────────────────────────────────────────────────
 
 const STAGES = ['Interested', 'Lead List Ready', 'Provided List'];
-const PARKED_STAGE = 'Parked';  // Holding stage — outside the normal pipeline flow
+const PARKED_STAGE = 'Parked';        // Holding stage — outside the normal pipeline flow
+const NEEDS_REPLY_STAGE = 'Needs Reply';  // Urgent holding stage — needs follow-up soon
+
+// Allowed Instantly campaign IDs — only leads from these campaigns enter the CRM.
+// Rejects leads from other accounts/campaigns sharing the same Instantly org webhooks.
+const ALLOWED_CAMPAIGN_IDS = new Set([
+  ...(process.env.INSTANTLY_WHOLESALE_CAMPAIGN_IDS || '').split(','),
+  process.env.INSTANTLY_TIKTOK_CAMPAIGN_ID || '',
+  process.env.INSTANTLY_WHOLESALE_REENGAGEMENT_CAMPAIGN_ID || '',
+  process.env.INSTANTLY_TIKTOK_REENGAGEMENT_CAMPAIGN_ID || '',
+].filter(Boolean));
 
 // ─── Column Indices (0-based, matching sheet columns A–K) ────────────────────
 
@@ -38,6 +48,7 @@ const LABEL_MAP = () => ({
   'Interested':    process.env.INSTANTLY_LABEL_INTERESTED,
   'Provided List': process.env.INSTANTLY_LABEL_PROVIDED_LIST,
   'Parked':        process.env.INSTANTLY_LABEL_PARKED || '-29997',
+  'Needs Reply':   process.env.INSTANTLY_LABEL_NEEDS_REPLY || '57',
 });
 
 // Instantly labels that should be treated as "Interested" in our pipeline.
@@ -551,6 +562,29 @@ async function notifySlack(lead, oldStage, newStage, suggestedReply) {
     });
   }
 
+  // Needs Reply / Unreply button
+  if (newStage === NEEDS_REPLY_STAGE) {
+    stageButtons.push({
+      type: 'button',
+      action_id: 'unreply_lead',
+      text: { type: 'plain_text', text: '♻️ Back to Interested', emoji: true },
+      value: lead.email,
+    });
+  } else if (newStage !== PARKED_STAGE) {
+    stageButtons.push({
+      type: 'button',
+      action_id: 'needs_reply_lead',
+      text: { type: 'plain_text', text: '🔴 Needs Reply', emoji: true },
+      value: lead.email,
+      confirm: {
+        title:   { type: 'plain_text', text: 'Mark as Needs Reply?' },
+        text:    { type: 'mrkdwn', text: `Flag *${lead.website || lead.email}* as *Needs Reply* for urgent follow-up.` },
+        confirm: { type: 'plain_text', text: 'Yes' },
+        deny:    { type: 'plain_text', text: 'Cancel' },
+      },
+    });
+  }
+
   if (stageButtons.length > 0) {
     blocks.push({
       type: 'actions',
@@ -581,13 +615,13 @@ async function advanceStage(email, newStage, extraUpdates = {}) {
   const found       = await findRowByEmail(email);
   const currentStage = found?.rowData[COL.STAGE] || null;
 
-  // Parked is always allowed — it's a special holding stage, not part of the linear pipeline
-  const isParking = newStage === PARKED_STAGE;
+  // Parked and Needs Reply are always allowed — special holding stages outside the linear pipeline
+  const isHoldingStage = newStage === PARKED_STAGE || newStage === NEEDS_REPLY_STAGE;
 
-  // Guard: don't move backward (unless parking)
+  // Guard: don't move backward (unless moving to a holding stage)
   const currentIdx = STAGES.indexOf(currentStage);
   const newIdx     = STAGES.indexOf(newStage);
-  if (!isParking && currentIdx >= 0 && newIdx <= currentIdx) {
+  if (!isHoldingStage && currentIdx >= 0 && newIdx <= currentIdx) {
     console.log(`[advance] skipped — ${email} already at "${currentStage}", not moving to "${newStage}"`);
     return;
   }
@@ -651,6 +685,13 @@ app.post('/webhook/instantly', async (req, res) => {
   try {
     const email = (body.lead_email || body.email || '').toLowerCase().trim();
     if (!email) return;
+
+    // Campaign gate: only accept leads from ListCRM campaigns
+    const campaignId = body.campaign_id || body.campaignId || '';
+    if (campaignId && ALLOWED_CAMPAIGN_IDS.size > 0 && !ALLOWED_CAMPAIGN_IDS.has(campaignId)) {
+      console.log(`[webhook] REJECTED — ${email} from campaign ${campaignId} (not a ListCRM campaign)`);
+      return;
+    }
 
     const website  = body.website || body.company_domain || body.companyDomain || '';
     const campaign = body.campaign_name || body.campaign || '';
@@ -991,6 +1032,50 @@ app.post('/slack/interactions', async (req, res) => {
       } catch (err) {
         console.error('[slack] unpark_lead error:', err.message);
         await axios.post(responseUrl, { text: `❌ Unpark failed: ${err.message}`, replace_original: false });
+      }
+
+    } else if (action.action_id === 'needs_reply_lead') {
+      try {
+        const found = await findRowByEmail(email);
+        const currentStage = found?.rowData[COL.STAGE] || 'Unknown';
+        const today = new Date().toISOString().slice(0, 10);
+        if (found) {
+          await updateRow(found.rowIndex, {
+            [COL.STAGE]:      NEEDS_REPLY_STAGE,
+            [COL.STAGE_DATE]: today,
+          });
+        }
+        await updateInstantlyLabel(email, NEEDS_REPLY_STAGE);
+        console.log(`[slack→needs_reply] ${email}: ${currentStage} → ${NEEDS_REPLY_STAGE}`);
+        await axios.post(responseUrl, {
+          replace_original: true,
+          blocks: withSentStatus(origBlocks, `🔴 *Needs Reply* (was ${currentStage}) — ${new Date().toLocaleString()}`),
+        });
+      } catch (err) {
+        console.error('[slack] needs_reply_lead error:', err.message);
+        await axios.post(responseUrl, { text: `❌ Needs Reply failed: ${err.message}`, replace_original: false });
+      }
+
+    } else if (action.action_id === 'unreply_lead') {
+      try {
+        const found = await findRowByEmail(email);
+        const restoreStage = STAGES[0];
+        const today = new Date().toISOString().slice(0, 10);
+        if (found) {
+          await updateRow(found.rowIndex, {
+            [COL.STAGE]:      restoreStage,
+            [COL.STAGE_DATE]: today,
+          });
+        }
+        await updateInstantlyLabel(email, restoreStage);
+        console.log(`[slack→unreply] ${email}: ${NEEDS_REPLY_STAGE} → ${restoreStage}`);
+        await axios.post(responseUrl, {
+          replace_original: true,
+          blocks: withSentStatus(origBlocks, `♻️ *Back to ${restoreStage}* (was Needs Reply) — ${new Date().toLocaleString()}`),
+        });
+      } catch (err) {
+        console.error('[slack] unreply_lead error:', err.message);
+        await axios.post(responseUrl, { text: `❌ Unreply failed: ${err.message}`, replace_original: false });
       }
     }
 
